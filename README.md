@@ -1,15 +1,23 @@
-# SharedPomo
+# PomoTogether
 
 <div align="center">
-  <img src="./assets/images/icon.png" alt="SharedPomo Logo" width="200"/>
+  <img src="./assets/images/appicon.png" alt="PomoTogether Logo" width="200"/>
   <p><em>Collaborative Pomodoro Timer App</em></p>
 </div>
 
 ## 📱 Overview
 
-SharedPomo is a collaborative Pomodoro timer app that allows users to create and join focused work sessions with friends, colleagues, or study groups. Stay productive together, even when physically apart!
+PomoTogether is a collaborative Pomodoro timer app that allows users to create and join focused work sessions with friends, colleagues, or study groups. Stay productive together, even when physically apart!
 
-![App Screenshot](./docs/screenshots/app-preview.png)
+## 📸 Screenshots
+
+<div align="center">
+  <img src="./docs/screenshots/home-screen.png" alt="Home Screen" width="250"/>
+  <img src="./docs/screenshots/session-screen.png" alt="Active Session" width="250"/>
+  <img src="./docs/screenshots/app-preview.png" alt="Active Session" width="250"/>
+  <img src="./docs/screenshots/2.png" alt="Active Sessions" width="250"/>
+  <img src="./docs/screenshots/break-screen.png" alt="Break Time" width="250"/>
+</div>
 
 ## ✨ Features
 
@@ -37,8 +45,8 @@ SharedPomo is a collaborative Pomodoro timer app that allows users to create and
 
 1. Clone the repository
    ```bash
-   git clone https://github.com/yourusername/SharedPomo.git
-   cd SharedPomo
+   git clone https://github.com/yourusername/PomoTogether.git
+   cd PomoTogether
    ```
 
 2. Install dependencies
@@ -93,20 +101,13 @@ eas build --platform android --profile preview
 4. **Communicate**: Chat with participants directly in the app
 5. **Stay Motivated**: Seeing others in your session helps maintain accountability
 
-## 📸 Screenshots
-
-<div align="center">
-  <img src="./docs/screenshots/home-screen.png" alt="Home Screen" width="250"/>
-  <img src="./docs/screenshots/session-screen.png" alt="Active Session" width="250"/>
-  <img src="./docs/screenshots/break-screen.png" alt="Break Time" width="250"/>
-</div>
 
 ## 🛠️ Development
 
 ### Project Structure
 
 ```
-SharedPomo/
+PomoTogether/
 ├── app/                  # Expo Router-based navigation
 │   ├── index.tsx         # Home screen
 │   ├── session.tsx       # Session screen
@@ -140,7 +141,7 @@ SharedPomo/
 
 ## 🔒 Privacy & Security
 
-SharedPomo respects user privacy:
+PomoTogether respects user privacy:
 - No user account required
 - Minimal data collection
 - Session data is temporary and deleted after session end
@@ -163,7 +164,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## 📞 Contact
 
-Project Link: [https://github.com/yourusername/SharedPomo](https://github.com/yourusername/SharedPomo)
+Project Link: [https://github.com/yourusername/PomoTogether](https://github.com/yourusername/PomoTogether)
 
 ---
 
