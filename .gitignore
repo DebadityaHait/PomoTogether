@@ -39,3 +39,4 @@ app-example
 
 # Firebase configuration
 config/firebase.config.ts
+config/firebase.config.js
