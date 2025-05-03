@@ -45,7 +45,7 @@ PomoTogether is a collaborative Pomodoro timer app that allows users to create a
 
 1. Clone the repository
    ```bash
-   git clone https://github.com/yourusername/PomoTogether.git
+   git clone https://github.com/DebadityaHait/PomoTogether.git
    cd PomoTogether
    ```
 
@@ -164,7 +164,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## 📞 Contact
 
-Project Link: [https://github.com/yourusername/PomoTogether](https://github.com/yourusername/PomoTogether)
+Project Link: [https://github.com/DebadityaHait/PomoTogether](https://github.com/DebadityaHait/PomoTogether)
 
 ---
 
