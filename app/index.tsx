@@ -82,137 +82,166 @@ const getAvatarSource = (avatarId: string) => {
 
 export default function Home() {
   const router = useRouter();
-  const { setUsername, avatar, setAvatar, joinSession, createSession } = useSession();
+  const { 
+    username: storedUsername, 
+    setUsername, 
+    setAvatar, 
+    avatar: currentAvatar, 
+    joinSession, 
+    createSession, 
+    isInSession,
+    currentSession
+  } = useSession();
   const { currentTheme, isDark } = useTheme();
-  const [storedUsername, setStoredUsername] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [joinError, setJoinError] = useState('');
   const [isJoining, setIsJoining] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
-  const [username, setUsernameInput] = useState('');
+  const [usernameInput, setUsernameInput] = useState('');
   const [sessionCode, setSessionCode] = useState('');
   const [showCreateUI, setShowCreateUI] = useState(false);
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [editUsername, setEditUsername] = useState('');
-  const [selectedAvatar, setSelectedAvatar] = useState(avatar || 'cat.png');
+  const [selectedAvatar, setSelectedAvatar] = useState(currentAvatar || 'cat.png');
+  const [isJoiningInitiated, setIsJoiningInitiated] = useState(false);
   
   // Animated values
   const fadeAnim = useState(new Animated.Value(0))[0];
   const slideAnim = useState(new Animated.Value(50))[0];
 
-  useEffect(() => {
-    // Animation sequence
-    Animated.parallel([
-      Animated.timing(fadeAnim, {
-        toValue: 1,
-        duration: 800,
-        useNativeDriver: true,
-      }),
-      Animated.timing(slideAnim, {
-        toValue: 0,
-        duration: 600,
-        useNativeDriver: true,
-      })
-    ]).start();
-  }, []);
+  // Define animation functions
+  const fadeIn = () => {
+    Animated.timing(fadeAnim, {
+      toValue: 1,
+      duration: 800,
+      useNativeDriver: true,
+    }).start();
+  };
+
+  const slideUp = () => {
+    Animated.timing(slideAnim, {
+      toValue: 0,
+      duration: 600,
+      useNativeDriver: true,
+    }).start();
+  };
 
   // Check for stored username and avatar on component mount
   useEffect(() => {
     const checkUserData = async () => {
       try {
-        const [username, avatarValue] = await Promise.all([
-          AsyncStorage.getItem('username'),
-          AsyncStorage.getItem('avatar')
-        ]);
-
-        if (username) {
-          setStoredUsername(username);
-          setUsername(username);
-          setEditUsername(username);
+        const storedName = await AsyncStorage.getItem('username');
+        if (storedName) {
+          setUsername(storedName);
+        } else {
+          setUsername('');
         }
-
-        if (avatarValue) {
-          // Make sure to set the avatar in state AND in context
-          setSelectedAvatar(avatarValue);
-          setAvatar(avatarValue);
-        } else if (selectedAvatar) {
-          // If no avatar in storage but we have a selected one, set it in context
-          setAvatar(selectedAvatar);
+        
+        const storedAvatar = await AsyncStorage.getItem('avatar');
+        if (storedAvatar) {
+          setAvatar(storedAvatar);
+        } else {
+          setAvatar('cat.png');
         }
-      } catch (error) {
-        console.error('Error retrieving user data:', error);
+      } catch (e) {
+        console.error("Failed to load user data", e);
+        setUsername('');
+        setAvatar('cat.png');
       } finally {
         setIsLoading(false);
+        fadeIn();
+        slideUp();
       }
     };
 
     checkUserData();
   }, []);
 
+  // Sync selectedAvatar with context avatar if it changes
+  useEffect(() => {
+    setSelectedAvatar(currentAvatar || 'cat.png');
+  }, [currentAvatar]);
+
+  // Navigate to session screen AFTER context confirms isInSession is true
+  useEffect(() => {
+    console.log(`[Navigation Check] isJoiningInitiated: ${isJoiningInitiated}, isInSession: ${isInSession}, currentSession exists: ${!!currentSession}`);
+    if (isJoiningInitiated && isInSession && currentSession) {
+      console.log('[Navigation Check] Conditions met! Navigating to /session...');
+      router.push('/session');
+      setIsJoiningInitiated(false); // Reset the flag
+    }
+  }, [isInSession, isJoiningInitiated, currentSession, router]);
+
   const saveUsername = async () => {
-    if (!username.trim()) return;
+    const nameToSave = usernameInput.trim();
+    if (!nameToSave) return;
     
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     try {
-      await Promise.all([
-        AsyncStorage.setItem('username', username),
-        AsyncStorage.setItem('avatar', selectedAvatar)
-      ]);
-      
-      setStoredUsername(username);
-      setUsername(username);
+      await AsyncStorage.setItem('username', nameToSave);
+      await AsyncStorage.setItem('avatar', selectedAvatar);
+      setUsername(nameToSave);
       setAvatar(selectedAvatar);
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    } catch (error) {
-      console.error('Error saving user data:', error);
+    } catch (e) {
+      console.error("Failed to save username", e);
     }
   };
 
   const saveProfile = async () => {
-    if (!editUsername.trim()) return;
+    const nameToSave = editUsername.trim();
+    if (!nameToSave) return;
     
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     try {
-      await Promise.all([
-        AsyncStorage.setItem('username', editUsername),
-        AsyncStorage.setItem('avatar', selectedAvatar)
-      ]);
-      
-      setStoredUsername(editUsername);
-      setUsername(editUsername);
+      await AsyncStorage.setItem('username', nameToSave);
+      await AsyncStorage.setItem('avatar', selectedAvatar);
+      setUsername(nameToSave);
       setAvatar(selectedAvatar);
       setShowProfileModal(false);
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    } catch (error) {
-      console.error('Error saving profile:', error);
+    } catch (e) {
+      console.error("Failed to save profile", e);
     }
   };
 
   const handleJoinSession = async () => {
-    if (!storedUsername || !sessionCode.trim()) return;
+    if (!storedUsername || !sessionCode.trim()) {
+      console.log('[handleJoinSession] Aborted: Missing username or session code.');
+      return;
+    }
     
+    console.log('[handleJoinSession] Attempting to join session with code:', sessionCode);
     setIsJoining(true);
     setJoinError('');
+    setIsJoiningInitiated(false); // Reset flag before attempting join
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     
     try {
-      // Ensure avatar is set in the context before joining
-      setAvatar(selectedAvatar);
+      console.log('[handleJoinSession] Setting avatar in context:', selectedAvatar);
+      setAvatar(selectedAvatar); // Ensure avatar is set in the context before joining
       
-      // Convert session code to uppercase before joining
       const uppercaseCode = sessionCode.trim().toUpperCase();
+      console.log('[handleJoinSession] Calling joinSession context function with code:', uppercaseCode);
       const success = await joinSession(uppercaseCode);
+      console.log('[handleJoinSession] joinSession returned:', success);
+      
       if (success) {
-        router.push('/session');
+        console.log('[handleJoinSession] Join reported success. Setting isJoiningInitiated = true.');
+        setIsJoiningInitiated(true); 
+        // Navigation will happen in the useEffect hook when isInSession becomes true
       } else {
-        setJoinError('Session not found. Please check the code.');
+        console.log('[handleJoinSession] Join reported failure.');
+        setJoinError('Session not found or failed to join. Please check the code.');
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+        setIsJoining(false); // Stop loading indicator on failure
       }
     } catch (error) {
-      console.error('Error joining session:', error);
-      setJoinError('Failed to join session. Please try again.');
+      console.error('[handleJoinSession] Error during joinSession call:', error);
+      setJoinError('Failed to join session due to an error. Please try again.');
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-    } finally {
-      setIsJoining(false);
-    }
+      setIsJoining(false); // Stop loading indicator on error
+      setIsJoiningInitiated(false); // Reset flag on error
+    } 
+    // Note: setIsJoining(false) is handled in success/error paths or component unmount
   };
 
   const handleCreateSession = async (
@@ -331,7 +360,7 @@ export default function Home() {
                   style={[styles.input, { color: currentTheme.onBackground }]}
                   placeholder="Your Name"
                   placeholderTextColor={currentTheme.onBackgroundSecondary + '80'}
-                  value={username}
+                  value={usernameInput}
                   onChangeText={setUsernameInput}
                   maxLength={20}
                   autoCapitalize="words"
@@ -360,10 +389,10 @@ export default function Home() {
               style={[
                 styles.button, 
                 { backgroundColor: currentTheme.primary },
-                !username.trim() && styles.buttonDisabled
+                !usernameInput.trim() && styles.buttonDisabled
               ]}
               onPress={saveUsername}
-              disabled={!username.trim()}
+              disabled={!usernameInput.trim()}
             >
               <Text style={styles.buttonText}>Get Started</Text>
               <Ionicons name="arrow-forward" size={20} color="#fff" />
@@ -403,7 +432,7 @@ export default function Home() {
           }}
         >
           <Image 
-            source={getAvatarSource(avatar)} 
+            source={getAvatarSource(currentAvatar)} 
             style={styles.headerAvatar} 
           />
         </TouchableOpacity>
@@ -518,7 +547,7 @@ export default function Home() {
                 Create Session
               </Text>
             </View>
-            
+
             <SessionSetup
               onCreateSession={handleCreateSession}
               isLoading={isCreating}

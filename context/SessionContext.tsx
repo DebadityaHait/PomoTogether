@@ -108,6 +108,15 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
   // Session cleanup interval ref (for all clients, but will only take effect on the first one that runs it)
   const sessionCleanupIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
+  // DEBUG: Log state changes for currentSession and participantId
+  useEffect(() => {
+    console.log(`[SessionContext State Change] currentSession updated: ${!!currentSession}, ID: ${currentSession?.id}`);
+  }, [currentSession]);
+
+  useEffect(() => {
+    console.log(`[SessionContext State Change] participantId updated: ${participantId}`);
+  }, [participantId]);
+
   // Check if user is in a session
   const isInSession = !!currentSession;
   
@@ -253,7 +262,7 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
         startedAt: null,
       },
     };
-    
+
     try {
       await setDoc(doc(db, 'sessions', newCode), sessionData);
       setSessionCode(newCode);
@@ -282,21 +291,29 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
   };
 
   // Join an existing session
-  const joinSession = async (code: string) => {
+  const joinSession = async (code: string): Promise<boolean> => {
+    console.log(`[SessionContext] joinSession called with code: ${code}, username: ${username}, avatar: ${avatar}`);
     try {
       // Check if session exists
-      const sessionDoc = await getDocs(query(collection(db, 'sessions'), where('id', '==', code)));
+      console.log(`[SessionContext] Querying sessions collection for id: ${code}`);
+      const sessionQuery = query(collection(db, 'sessions'), where('id', '==', code));
+      const sessionDocSnapshot = await getDocs(sessionQuery);
       
-      if (sessionDoc.empty) {
+      if (sessionDocSnapshot.empty) {
+        console.log(`[SessionContext] Session with code ${code} not found.`);
         return false;
       }
-      
+      console.log(`[SessionContext] Session found.`);
+
       // Get the session data
-      const sessionData = sessionDoc.docs[0].data() as Session;
+      const sessionData = sessionDocSnapshot.docs[0].data() as Session;
+      console.log(`[SessionContext] Session data fetched:`, JSON.stringify(sessionData, null, 2));
       
       // Get existing participants
+      console.log(`[SessionContext] Querying participants for session: ${code}`);
       const participantsQuery = await getDocs(collection(db, 'sessions', code, 'participants'));
       const existingParticipants = participantsQuery.docs.map(doc => doc.data() as Participant);
+      console.log(`[SessionContext] Found ${existingParticipants.length} existing participants.`);
       
       // Check if a user with the same username and avatar already exists
       const existingParticipant = existingParticipants.find(
@@ -304,27 +321,30 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
       );
       
       let participantDocId: string;
+      let isReconnecting = false;
       
       if (existingParticipant) {
         // Use the existing participant's ID
         participantDocId = existingParticipant.id;
-        console.log(`User ${username} reconnecting with existing ID: ${participantDocId}`);
-        setParticipantId(participantDocId);
+        isReconnecting = true;
+        console.log(`[SessionContext] User ${username} reconnecting with existing ID: ${participantDocId}`);
         
-        // Update the lastSeen timestamp and any other relevant fields
+        // Update the lastSeen timestamp and ensure not removed
+        console.log(`[SessionContext] Updating existing participant ${participantDocId} in Firestore...`);
         await setDoc(
           doc(db, 'sessions', code, 'participants', participantDocId),
           {
             lastSeen: new Date(),
-            removed: false, // In case they were previously marked as removed
+            removed: false, 
             removedAt: null
           },
           { merge: true }
         );
+        console.log(`[SessionContext] Participant ${participantDocId} updated.`);
       } else {
         // Generate a unique ID for this participant
         participantDocId = Math.random().toString(36).substring(2, 9);
-        setParticipantId(participantDocId);
+        console.log(`[SessionContext] New user ${username}. Generated participant ID: ${participantDocId}`);
 
         // Add user to participants
         const participantData: Participant = {
@@ -335,41 +355,65 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
           joinedAt: new Date(),
           lastSeen: new Date(),
         };
-
+        console.log(`[SessionContext] Adding new participant ${participantDocId} to Firestore...`);
         await setDoc(
           doc(db, 'sessions', code, 'participants', participantDocId),
           participantData
         );
+        console.log(`[SessionContext] Participant ${participantDocId} added.`);
       }
-      
+
+      // Set participant ID in state
+      console.log(`[SessionContext] Setting participantId state to: ${participantDocId}`);
+      setParticipantId(participantDocId); // Set this participant's ID
+
       // Set session code and current session data
+      console.log(`[SessionContext] Setting sessionCode state to: ${code}`);
       setSessionCode(code);
+      console.log(`[SessionContext] Setting currentSession state...`, JSON.stringify(sessionData, null, 2));
       setCurrentSession(sessionData);
       
-      // Calculate actual time remaining (safer handling for timeRemaining and timestamps)
+      // Calculate actual time remaining
+      console.log(`[SessionContext] Calculating actual time remaining...`);
       let actualTimeRemaining = sessionData.state?.timeRemaining || sessionData.workMinutes * 60;
-      
       if (sessionData.state?.isRunning && sessionData.state?.startedAt) {
         const startedAt = convertToDate(sessionData.state.startedAt);
-        
         if (startedAt) {
           const now = new Date();
           const elapsedSeconds = Math.floor((now.getTime() - startedAt.getTime()) / 1000);
-          actualTimeRemaining = Math.max(0, actualTimeRemaining - elapsedSeconds);
+          actualTimeRemaining = Math.max(0, (sessionData.state?.timeRemaining || 0) - elapsedSeconds);
+          console.log(`[SessionContext] Timer running. StartedAt: ${startedAt}, Elapsed: ${elapsedSeconds}s, Calculated time remaining: ${actualTimeRemaining}`);
+        } else {
+          console.log(`[SessionContext] Timer running but invalid startedAt:`, sessionData.state.startedAt);
         }
+      } else {
+        console.log(`[SessionContext] Timer not running or no startedAt. Initial time remaining: ${actualTimeRemaining}`);
       }
       
-      // Initialize timer state from session data with actual time remaining
-      setTimerState({
+      // Initialize timer state from session data
+      const newTimerState = {
         isRunning: sessionData.state?.isRunning || false,
         currentPhase: (sessionData.state?.currentPhase || 'work') as 'work' | 'break' | 'longBreak',
         timeRemaining: actualTimeRemaining,
         round: sessionData.state?.round || 1,
-      });
+      };
+      console.log(`[SessionContext] Setting timerState...`, JSON.stringify(newTimerState, null, 2));
+      setTimerState(newTimerState);
       
+      console.log(`[SessionContext] joinSession finished successfully. Returning true.`);
       return true;
     } catch (error) {
-      console.error('Error joining session:', error);
+      console.error('[SessionContext] Error in joinSession:', error);
+      // Reset potentially partially set state on error
+      setSessionCode('');
+      setCurrentSession(null);
+      setParticipantId('');
+      setTimerState({
+        isRunning: false,
+        currentPhase: 'work',
+        timeRemaining: 25 * 60,
+        round: 1,
+      });
       return false;
     }
   };
@@ -595,9 +639,12 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
       setParticipants(participants);
       
       // Check if current user has been kicked (no longer in participants list)
+      // --- TEMPORARILY COMMENTED OUT TO DEBUG JOIN ISSUE ---
+      /*
       if (participantId && !participants.some(p => p.id === participantId)) {
         // Current user is no longer in participants list - they've been kicked
         // Reset local state to send them back to join/create screen
+        console.log(`[SessionContext Participant Listener] User ${participantId} not found in participants list. Resetting state.`);
         setSessionCode('');
         setCurrentSession(null);
         setParticipants([]);
@@ -610,6 +657,8 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
         });
         // Keep participantId so they can rejoin with a different session
       }
+      */
+      // --- END TEMPORARY COMMENT ---
     });
 
     return () => unsubscribe();
@@ -722,13 +771,13 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
       
       const inactiveParticipants = allParticipants.filter(participant => {
         try {
-          // Don't remove the host
-          if (participant.id === currentSession?.hostId) return false;
-          
-          // Check if participant is inactive
-          const lastSeen = participant.lastSeen;
-          if (!lastSeen) return true; // No lastSeen timestamp, consider inactive
-          
+        // Don't remove the host
+        if (participant.id === currentSession?.hostId) return false;
+        
+        // Check if participant is inactive
+        const lastSeen = participant.lastSeen;
+        if (!lastSeen) return true; // No lastSeen timestamp, consider inactive
+        
           // Safe conversion to date
           let lastSeenDate: Date;
           try {
@@ -763,8 +812,8 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
             return true; // Consider inactive if date is invalid
           }
           
-          const timeSinceLastSeen = now.getTime() - lastSeenDate.getTime();
-          return timeSinceLastSeen > inactiveThreshold;
+        const timeSinceLastSeen = now.getTime() - lastSeenDate.getTime();
+        return timeSinceLastSeen > inactiveThreshold;
         } catch (err) {
           console.warn(`Error checking if participant ${participant.id} is inactive:`, err);
           return true; // Consider inactive if there's any error in processing
@@ -814,14 +863,14 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
       if (isNaN(dateObj.getTime())) {
         return 'invalid date';
       }
-      
-      const now = new Date();
+    
+    const now = new Date();
       const seconds = Math.floor((now.getTime() - dateObj.getTime()) / 1000);
-      
-      if (seconds < 60) return `${seconds} seconds ago`;
-      if (seconds < 3600) return `${Math.floor(seconds / 60)} minutes ago`;
-      if (seconds < 86400) return `${Math.floor(seconds / 3600)} hours ago`;
-      return `${Math.floor(seconds / 86400)} days ago`;
+    
+    if (seconds < 60) return `${seconds} seconds ago`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)} minutes ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)} hours ago`;
+    return `${Math.floor(seconds / 86400)} days ago`;
     } catch (error) {
       console.warn('Error formatting time:', error);
       return 'error calculating time';
@@ -902,7 +951,7 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     }
   };
 
-  // Listen for chat messages
+  // Listen for chat messages (modified to handle IDs)
   useEffect(() => {
     if (!sessionCode) return;
 
@@ -910,44 +959,76 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     const messagesQuery = query(
       messagesRef,
       orderBy('timestamp', 'desc'),
-      limit(50)
+      limit(50) // Consider increasing limit if chat is very active
     );
 
+    console.log('[SessionContext] Setting up chat messages listener...');
     const unsubscribe = onSnapshot(messagesQuery, (snapshot) => {
+      console.log(`[SessionContext] Chat snapshot received with ${snapshot.docs.length} docs.`);
       const newMessages: Message[] = [];
       snapshot.forEach((doc) => {
         const data = doc.data();
+        // Prioritize Firestore doc.id, use sender+timestamp as a fallback for key if needed
+        // Although the tempId approach in sendMessage should make this less critical
+        const messageId = doc.id || `fallback_${data.senderId}_${data.timestamp?.seconds || Date.now()}`;
         newMessages.push({
-          id: doc.id,
+          id: messageId, // Ensure ID is always present
           senderId: data.senderId,
           senderName: data.senderName,
           text: data.text,
           timestamp: data.timestamp instanceof Timestamp 
             ? data.timestamp.toDate() 
-            : new Date(data.timestamp),
+            : (data.timestamp ? new Date(data.timestamp) : new Date()), // Handle potential undefined timestamp
         });
       });
       // Sort messages chronologically (oldest first)
+      console.log(`[SessionContext] Updating messages state with ${newMessages.length} messages.`);
       setMessages(newMessages.reverse());
+    }, (error) => {
+      console.error("[SessionContext] Error in chat messages listener:", error);
     });
 
-    return () => unsubscribe();
+    return () => {
+      console.log('[SessionContext] Cleaning up chat messages listener.');
+      unsubscribe();
+    }
   }, [sessionCode]);
 
   // Send a new chat message
   const sendMessage = async (text: string) => {
     if (!sessionCode || !participantId || !username || !text.trim()) return;
 
+    // Generate a temporary client-side ID for immediate rendering
+    const tempId = `temp_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+
+    const messageData = {
+      id: tempId, // Include the temporary ID
+      senderId: participantId,
+      senderName: username,
+      text: text.trim(),
+      timestamp: new Date()
+    };
+
     try {
+      console.log(`[SessionContext] Sending message (tempId: ${tempId}):`, messageData);
       const messagesRef = collection(db, 'sessions', sessionCode, 'messages');
+      // Add to Firestore (Firestore will assign its own ID eventually)
       await addDoc(messagesRef, {
-        senderId: participantId,
-        senderName: username,
-        text: text.trim(),
-        timestamp: new Date()
+        // Don't save the tempId to Firestore
+        senderId: messageData.senderId,
+        senderName: messageData.senderName,
+        text: messageData.text,
+        timestamp: messageData.timestamp
       });
+      console.log(`[SessionContext] Message added to Firestore successfully.`);
+      
+      // Optional: Optimistically add to local state immediately? 
+      // Currently relying on onSnapshot, which is generally fine.
+      // setMessages(prev => [...prev, messageData]); 
+
     } catch (error) {
-      console.error('Error sending message:', error);
+      console.error('[SessionContext] Error sending message:', error);
+      // Maybe remove the optimistically added message if needed
     }
   };
 

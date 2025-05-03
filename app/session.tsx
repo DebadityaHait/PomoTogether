@@ -73,10 +73,12 @@ export default function SessionScreen() {
   useEffect(() => {
     setTaskInputValue(currentTask);
   }, [currentTask]);
-  
+
   // Redirect to home if not in a session
   useEffect(() => {
+    console.log(`[SessionScreen Redirect Check] Running effect. isInSession: ${isInSession}, isLeaving: ${isLeaving}`);
     if (!isInSession && !isLeaving) {
+      console.log('[SessionScreen Redirect Check] Conditions met! Redirecting to /...');
       router.replace('/');
     }
   }, [isInSession, isLeaving]);
@@ -194,7 +196,7 @@ export default function SessionScreen() {
             <View 
               key="additional-participants-count"
               style={[styles.participantAvatar, { 
-                backgroundColor: currentTheme.surface, 
+        backgroundColor: currentTheme.surface,
                 marginLeft: -10,
                 zIndex: 0
               }]}
@@ -210,24 +212,24 @@ export default function SessionScreen() {
         {/* Timer Tab */}
         {activeTab === 'timer' && (
           <View style={styles.timerTab}>
-            <View style={styles.timerContainer}>
-              <TimerCircle
-                timeRemaining={timerState.timeRemaining}
-                totalTime={getTotalTime()}
-                isRunning={timerState.isRunning}
-                phase={timerState.currentPhase}
-                onStart={startTimer}
-                onPause={pauseTimer}
-                onSkip={skipPhase}
-                isHost={isHost}
-              />
+        <View style={styles.timerContainer}>
+          <TimerCircle
+            timeRemaining={timerState.timeRemaining}
+            totalTime={getTotalTime()}
+            isRunning={timerState.isRunning}
+            phase={timerState.currentPhase}
+            onStart={startTimer}
+            onPause={pauseTimer}
+            onSkip={skipPhase}
+            isHost={isHost}
+          />
 
-              <View style={styles.roundInfo}>
+          <View style={styles.roundInfo}>
                 <Text style={[styles.roundText, { color: currentTheme.onBackgroundSecondary }]}>
                   ROUND {timerState.round} OF {currentSession.rounds}
-                </Text>
-              </View>
-              
+            </Text>
+        </View>
+
               {/* Task Input Direct in Timer View */}
               {isEditingTask ? (
                 <View style={[styles.taskInputContainer, { backgroundColor: currentTheme.inputBackground }]}>
@@ -239,18 +241,18 @@ export default function SessionScreen() {
                     placeholderTextColor={currentTheme.onBackgroundSecondary + '80'}
                     autoFocus
                   />
-                  <TouchableOpacity
+          <TouchableOpacity
                     style={[styles.saveTaskButton, { backgroundColor: currentTheme.primary }]}
                     onPress={handleSaveTask}
-                  >
+          >
                     <Ionicons name="checkmark" size={20} color="#fff" />
-                  </TouchableOpacity>
+          </TouchableOpacity>
                 </View>
               ) : (
-                <TouchableOpacity 
+          <TouchableOpacity
                   style={styles.currentTaskButton}
                   onPress={() => setIsEditingTask(true)}
-                >
+          >
                   {currentTask ? (
                     <Text style={[styles.currentTaskText, { color: currentTheme.onBackground }]}>
                       {currentTask}
@@ -258,24 +260,24 @@ export default function SessionScreen() {
                   ) : (
                     <Text style={[styles.addTaskText, { color: currentTheme.onBackgroundSecondary }]}>
                       Tap to add your current task
-                    </Text>
+            </Text>
                   )}
-                </TouchableOpacity>
+          </TouchableOpacity>
               )}
             </View>
-          </View>
+        </View>
         )}
         
         {/* Members Tab */}
         {activeTab === 'members' && (
           <View style={styles.membersTab}>
-            <ParticipantList
-              participants={participants}
-              currentUserId={participants.find(p => p.username === username)?.id}
+              <ParticipantList
+                participants={participants}
+                currentUserId={participants.find(p => p.username === username)?.id}
               isHost={isHost}
               onKickParticipant={isHost ? kickParticipant : undefined}
-            />
-          </View>
+              />
+            </View>
         )}
         
         {/* Chat Tab */}

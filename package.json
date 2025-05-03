@@ -10,9 +10,10 @@
     "web": "expo start --web",
     "test": "jest --watchAll",
     "lint": "expo lint",
+    "prepare-build": "node ./scripts/prepare-build.js",
     "build:configure": "npx eas-cli build:configure",
-    "build:android": "npx eas-cli build --platform android --profile preview",
-    "build:android-apk": "npx eas-cli build --platform android --profile development --local",
+    "build:android": "npm run prepare-build && npx eas-cli build --platform android --profile preview",
+    "build:android-apk": "npm run prepare-build && npx eas-cli build --platform android --profile development --local",
     "prebuild": "expo prebuild",
     "build:apk": "npm run prebuild && cd android && ./gradlew assembleRelease"
   },

@@ -166,8 +166,8 @@ const TimerCircle: React.FC<TimerCircleProps> = ({
             {getPhaseText()}
           </Text>
           <Text style={[styles.time, { color: currentTheme.onBackground }]}>
-            {formatTime(timeRemaining)}
-          </Text>
+          {formatTime(timeRemaining)}
+        </Text>
           <Text style={[styles.status, { 
             color: isRunning ? currentTheme.success : currentTheme.warning 
           }]}>

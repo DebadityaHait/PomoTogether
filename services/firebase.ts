@@ -1,7 +1,7 @@
 import { initializeApp, getApps } from 'firebase/app';
 import { getFirestore, initializeFirestore } from 'firebase/firestore';
 import { getFunctions } from 'firebase/functions';
-import firebaseConfig from '../config/firebase.config';
+import firebaseConfig from '../config/firebase.config.js';
 
 // Initialize Firebase
 let app;
