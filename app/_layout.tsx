@@ -6,7 +6,6 @@ import { StatusBar } from 'expo-status-bar';
 import { useEffect } from 'react';
 import 'react-native-reanimated';
 
-import { useColorScheme } from '@/hooks/useColorScheme';
 import { SessionProvider } from '../context/SessionContext';
 import { ThemeProvider, useTheme } from '../context/ThemeContext';
 

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useCallback, useState, useRef, useEffect } from 'react';
 import {
   View,
   Text,
@@ -35,43 +35,34 @@ const SessionChat: React.FC = () => {
   const { messages, sendMessage, participantId } = useSession();
   const { currentTheme } = useTheme();
   const [newMessage, setNewMessage] = useState('');
-  const [isKeyboardVisible, setKeyboardVisible] = useState(false);
   const flatListRef = useRef<FlatList>(null);
+
+  const scrollToBottom = useCallback(() => {
+    if (flatListRef.current && messages.length > 0) {
+      flatListRef.current.scrollToEnd({ animated: true });
+    }
+  }, [messages.length]);
 
   // Subscribe to keyboard events
   useEffect(() => {
     const keyboardDidShowListener = Keyboard.addListener(
       'keyboardDidShow',
       () => {
-        setKeyboardVisible(true);
         scrollToBottom();
-      }
-    );
-    const keyboardDidHideListener = Keyboard.addListener(
-      'keyboardDidHide',
-      () => {
-        setKeyboardVisible(false);
       }
     );
 
     return () => {
       keyboardDidShowListener.remove();
-      keyboardDidHideListener.remove();
     };
-  }, []);
+  }, [scrollToBottom]);
 
   // Scroll to bottom when new messages arrive
   useEffect(() => {
     if (messages.length > 0) {
       scrollToBottom();
     }
-  }, [messages]);
-
-  const scrollToBottom = () => {
-    if (flatListRef.current && messages.length > 0) {
-      flatListRef.current.scrollToEnd({ animated: true });
-    }
-  };
+  }, [messages, scrollToBottom]);
 
   const handleSendMessage = () => {
     if (newMessage.trim().length === 0) return;

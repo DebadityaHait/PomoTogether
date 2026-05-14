@@ -44,7 +44,7 @@ const TimerCircle: React.FC<TimerCircleProps> = ({
       duration: 500,
       easing: Easing.bezierFn(0.25, 0.1, 0.25, 1),
     });
-  }, [timeRemaining, totalTime]);
+  }, [progress, timeRemaining, totalTime]);
 
   // Animated circle props
   const animatedProps = useAnimatedProps(() => {
@@ -269,7 +269,6 @@ const styles = StyleSheet.create({
   },
   controlsContainer: {
     flexDirection: 'row',
-    justifyContent: 'center',
     alignItems: 'center',
     marginTop: 20,
     width: 130,

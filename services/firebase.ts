@@ -1,5 +1,5 @@
 import { initializeApp, getApps } from 'firebase/app';
-import { getFirestore, initializeFirestore } from 'firebase/firestore';
+import { Firestore, getFirestore, initializeFirestore } from 'firebase/firestore';
 import { getFunctions } from 'firebase/functions';
 import firebaseConfig from '../config/firebase.config.js';
 
@@ -11,11 +11,18 @@ if (!getApps().length) {
   app = getApps()[0];
 }
 
-// Initialize Firestore with long polling configuration
-// This prevents "WebChannelConnection RPC 'Write' stream transport errored" issues
-export const db = initializeFirestore(app, {
-  experimentalForceLongPolling: true
-});
+// Initialize Firestore with long polling configuration. Fast refresh can evaluate this
+// module more than once, so fall back to the existing instance if it is already ready.
+let firestore: Firestore;
+try {
+  firestore = initializeFirestore(app, {
+    experimentalForceLongPolling: true
+  });
+} catch {
+  firestore = getFirestore(app);
+}
+
+export const db = firestore;
 
 // Initialize Cloud Functions
 export const functions = getFunctions(app);

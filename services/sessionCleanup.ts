@@ -1,5 +1,17 @@
 import { db } from './firebase';
-import { collection, query, where, getDocs, doc, getDoc, deleteDoc, Timestamp } from 'firebase/firestore';
+import { collection, getDocs, doc, deleteDoc, Timestamp } from 'firebase/firestore';
+
+const toDate = (value: unknown): Date | null => {
+  if (!value) return null;
+  if (value instanceof Date) return value;
+  if (value instanceof Timestamp) return value.toDate();
+  if (typeof value === 'object' && value !== null && 'toDate' in value && typeof (value as any).toDate === 'function') {
+    return (value as any).toDate();
+  }
+
+  const date = new Date(value as string | number);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
 
 /**
  * Checks for and removes inactive sessions where no participants have been active for more than 10 minutes.
@@ -34,14 +46,8 @@ export const cleanupInactiveSessions = async () => {
       
       for (const participantDoc of participantsSnapshot.docs) {
         const participant = participantDoc.data();
-        if (participant.lastSeen) {
-          // Convert Firebase timestamp if needed
-          const lastSeenDate = participant.lastSeen instanceof Date 
-            ? participant.lastSeen 
-            : participant.lastSeen instanceof Timestamp
-              ? participant.lastSeen.toDate()
-              : new Date(participant.lastSeen);
-          
+        const lastSeenDate = toDate(participant.lastSeen);
+        if (lastSeenDate) {
           if (lastSeenDate > mostRecentActivity) {
             mostRecentActivity = lastSeenDate;
           }
@@ -72,32 +78,16 @@ export const cleanupInactiveSessions = async () => {
  */
 const deleteSession = async (sessionId: string): Promise<void> => {
   try {
-    // First, delete all participants
-    const participantsRef = collection(db, 'sessions', sessionId, 'participants');
-    const participantsSnapshot = await getDocs(participantsRef);
-    
-    const deleteParticipantPromises = participantsSnapshot.docs.map(participantDoc => 
-      deleteDoc(doc(db, 'sessions', sessionId, 'participants', participantDoc.id))
-    );
-    
-    // Delete any activity logs if they exist
-    try {
-      const activityLogRef = collection(db, 'sessions', sessionId, 'activityLog');
-      const activityLogSnapshot = await getDocs(activityLogRef);
-      
-      const deleteActivityLogPromises = activityLogSnapshot.docs.map(logDoc => 
-        deleteDoc(doc(db, 'sessions', sessionId, 'activityLog', logDoc.id))
-      );
-      
-      await Promise.all(deleteActivityLogPromises);
-    } catch (error) {
-      console.error(`Error deleting activity logs for session ${sessionId}:`, error);
-      // Continue with session deletion even if activity log deletion fails
+    // Delete known subcollections before deleting the session document.
+    for (const subcollection of ['participants', 'activityLog', 'messages']) {
+      try {
+        const snapshot = await getDocs(collection(db, 'sessions', sessionId, subcollection));
+        await Promise.all(snapshot.docs.map(item => deleteDoc(doc(db, 'sessions', sessionId, subcollection, item.id))));
+      } catch (error) {
+        console.error(`Error deleting ${subcollection} for session ${sessionId}:`, error);
+      }
     }
-    
-    // Wait for all participant deletions to complete
-    await Promise.all(deleteParticipantPromises);
-    
+
     // Finally delete the session document itself
     await deleteDoc(doc(db, 'sessions', sessionId));
     

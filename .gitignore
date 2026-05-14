@@ -25,6 +25,10 @@ npm-debug.*
 yarn-debug.*
 yarn-error.*
 
+# test and lint output
+coverage/
+.eslintcache
+
 # macOS
 .DS_Store
 *.pem

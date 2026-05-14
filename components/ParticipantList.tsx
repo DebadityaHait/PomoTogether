@@ -8,7 +8,7 @@ interface Participant {
   id: string;
   username: string;
   currentTask: string;
-  joinedAt: Date;
+  joinedAt?: unknown;
   avatar?: string;
 }
 
@@ -33,7 +33,10 @@ const getAvatarSource = (avatarId: string | undefined) => {
     'polar-bear.png': require('../usericons/polar-bear.png'),
     'poo.png': require('../usericons/poo.png'),
     'sea-lion.png': require('../usericons/sea-lion.png'),
-    'tiger.png': require('../usericons/tiger.png')
+    'hippo.png': require('../usericons/hippo.png'),
+    'snake.png': require('../usericons/snake.png'),
+    'tiger.png': require('../usericons/tiger.png'),
+    'turtle.png': require('../usericons/turtle.png')
   };
   
   return avatarMap[avatarId] || avatarMap['cat.png'];

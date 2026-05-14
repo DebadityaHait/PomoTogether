@@ -1,5 +1,4 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { useColorScheme as useDeviceColorScheme } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Colors from '../constants/Colors';
 
@@ -131,7 +130,6 @@ const THEME_STORAGE_KEY = 'pomo-theme-preference';
 
 // Provider component
 export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const deviceColorScheme = useDeviceColorScheme();
   // For now, always use dark theme as per the requirement
   const [isDark, setIsDark] = useState<boolean>(true);
   const [isLoaded, setIsLoaded] = useState(false);

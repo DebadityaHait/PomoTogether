@@ -1,11 +1,10 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState } from 'react';
 import { 
   View, 
   StyleSheet, 
   Text, 
   TouchableOpacity, 
   Alert, 
-  Dimensions,
   StatusBar as RNStatusBar,
   Platform,
   TextInput,
@@ -22,8 +21,6 @@ import SessionChat from '../components/SessionChat';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as Haptics from 'expo-haptics';
 
-const { width, height } = Dimensions.get('window');
-
 // Helper function to get avatar source
 const getAvatarSource = (avatarId: string | undefined) => {
   if (!avatarId) return null;
@@ -38,7 +35,10 @@ const getAvatarSource = (avatarId: string | undefined) => {
     'polar-bear.png': require('../usericons/polar-bear.png'),
     'poo.png': require('../usericons/poo.png'),
     'sea-lion.png': require('../usericons/sea-lion.png'),
-    'tiger.png': require('../usericons/tiger.png')
+    'hippo.png': require('../usericons/hippo.png'),
+    'snake.png': require('../usericons/snake.png'),
+    'tiger.png': require('../usericons/tiger.png'),
+    'turtle.png': require('../usericons/turtle.png')
   };
   
   return avatarMap[avatarId] || avatarMap['cat.png'];
@@ -47,7 +47,6 @@ const getAvatarSource = (avatarId: string | undefined) => {
 export default function SessionScreen() {
   const router = useRouter();
   const {
-    username,
     sessionCode,
     currentSession,
     isInSession,
@@ -61,6 +60,7 @@ export default function SessionScreen() {
     skipPhase,
     isHost,
     kickParticipant,
+    participantId,
   } = useSession();
   const { currentTheme } = useTheme();
 
@@ -81,7 +81,7 @@ export default function SessionScreen() {
       console.log('[SessionScreen Redirect Check] Conditions met! Redirecting to /...');
       router.replace('/');
     }
-  }, [isInSession, isLeaving]);
+  }, [isInSession, isLeaving, router]);
 
   const handleLeaveSession = async () => {
     Alert.alert(
@@ -273,7 +273,7 @@ export default function SessionScreen() {
           <View style={styles.membersTab}>
               <ParticipantList
                 participants={participants}
-                currentUserId={participants.find(p => p.username === username)?.id}
+                currentUserId={participantId}
               isHost={isHost}
               onKickParticipant={isHost ? kickParticipant : undefined}
               />

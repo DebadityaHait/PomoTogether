@@ -8,7 +8,7 @@ const secondaryColor = '#53CFFF'; // Bright blue
 const accentColor = '#FF5A8C'; // Vibrant pink
 
 // Dark theme specific colors
-export default {
+const AppColors = {
   // Brand colors
   primary: primaryColor,
   primaryLight: '#A18AFF',
@@ -60,3 +60,24 @@ export default {
   timerRing: '#8A6FFF',
   timerRingBackground: 'rgba(255, 255, 255, 0.1)',
 };
+
+export const Colors = {
+  light: {
+    text: '#11181C',
+    background: '#FFFFFF',
+    tint: primaryColor,
+    icon: '#687076',
+    tabIconDefault: '#687076',
+    tabIconSelected: primaryColor,
+  },
+  dark: {
+    text: AppColors.onBackground,
+    background: AppColors.background,
+    tint: AppColors.primaryLight,
+    icon: AppColors.onBackgroundSecondary,
+    tabIconDefault: AppColors.onBackgroundSecondary,
+    tabIconSelected: AppColors.primaryLight,
+  },
+};
+
+export default AppColors;

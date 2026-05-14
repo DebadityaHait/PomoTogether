@@ -2,6 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { View, Text, StyleSheet, Animated, TouchableOpacity } from 'react-native';
 import { AntDesign } from '@expo/vector-icons';
 
+type AntDesignIconName = React.ComponentProps<typeof AntDesign>['name'];
+
 interface NotificationProps {
   message: string;
   type: 'info' | 'success' | 'warning' | 'error';
@@ -33,9 +35,9 @@ const Notification: React.FC<NotificationProps> = ({
     ]).start(() => {
       onDismiss();
     });
-  }, []);
+  }, [duration, fadeAnim, onDismiss]);
   
-  const getIconAndColor = () => {
+  const getIconAndColor = (): { icon: AntDesignIconName; color: string } => {
     switch (type) {
       case 'info':
         return { icon: 'infocirlce', color: '#3498db' };
@@ -72,12 +74,14 @@ const Notification: React.FC<NotificationProps> = ({
   );
 };
 
+interface NotificationItem {
+  id: string;
+  message: string;
+  type: 'info' | 'success' | 'warning' | 'error';
+}
+
 interface NotificationSystemProps {
-  notifications: Array<{
-    id: string;
-    message: string;
-    type: 'info' | 'success' | 'warning' | 'error';
-  }>;
+  notifications: NotificationItem[];
   onDismiss: (id: string) => void;
 }
 

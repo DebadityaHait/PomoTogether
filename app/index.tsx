@@ -6,12 +6,9 @@ import {
   TouchableOpacity, 
   ActivityIndicator,
   TextInput,
-  KeyboardAvoidingView,
   Platform,
-  Dimensions,
   Animated,
   Modal,
-  ScrollView,
   Image,
   FlatList,
   SafeAreaView,
@@ -25,33 +22,7 @@ import { StatusBar } from 'expo-status-bar';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
 import * as Haptics from 'expo-haptics';
-import { useFonts } from 'expo-font';
 import SessionSetup from '../components/SessionSetup';
-
-const { width, height } = Dimensions.get('window');
-
-// Rainbow gradient text component
-interface GradientTextProps {
-  text: string;
-  style?: any;
-}
-
-const GradientText: React.FC<GradientTextProps> = ({ text, style }) => {
-  return (
-    <View style={{ position: 'relative' }}>
-      <LinearGradient
-        colors={['#6A3DE8', '#E47AE8', '#FF9D80']}
-        start={{ x: 0, y: 0 }}
-        end={{ x: 1, y: 0 }}
-        style={{ padding: 5, borderRadius: 5 }}
-      >
-        <Text style={[{ fontWeight: 'bold', color: '#fff' }, style]}>
-          {text}
-        </Text>
-      </LinearGradient>
-    </View>
-  );
-};
 
 interface AvatarItem {
   id: string;
@@ -109,23 +80,6 @@ export default function Home() {
   const fadeAnim = useState(new Animated.Value(0))[0];
   const slideAnim = useState(new Animated.Value(50))[0];
 
-  // Define animation functions
-  const fadeIn = () => {
-    Animated.timing(fadeAnim, {
-      toValue: 1,
-      duration: 800,
-      useNativeDriver: true,
-    }).start();
-  };
-
-  const slideUp = () => {
-    Animated.timing(slideAnim, {
-      toValue: 0,
-      duration: 600,
-      useNativeDriver: true,
-    }).start();
-  };
-
   // Check for stored username and avatar on component mount
   useEffect(() => {
     const checkUserData = async () => {
@@ -149,13 +103,21 @@ export default function Home() {
         setAvatar('cat.png');
       } finally {
         setIsLoading(false);
-        fadeIn();
-        slideUp();
+        Animated.timing(fadeAnim, {
+          toValue: 1,
+          duration: 800,
+          useNativeDriver: true,
+        }).start();
+        Animated.timing(slideAnim, {
+          toValue: 0,
+          duration: 600,
+          useNativeDriver: true,
+        }).start();
       }
     };
 
     checkUserData();
-  }, []);
+  }, [fadeAnim, setAvatar, setUsername, slideAnim]);
 
   // Sync selectedAvatar with context avatar if it changes
   useEffect(() => {

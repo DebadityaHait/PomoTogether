@@ -1,5 +1,21 @@
-import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
-import { doc, setDoc, onSnapshot, collection, query, where, getDocs, serverTimestamp, deleteDoc, addDoc, orderBy, limit, Timestamp, getDoc } from 'firebase/firestore';
+import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
+import {
+  DocumentData,
+  Timestamp,
+  addDoc,
+  collection,
+  deleteDoc,
+  doc,
+  getDoc,
+  getDocs,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  runTransaction,
+  serverTimestamp,
+  setDoc,
+} from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { generateSessionCode } from '../utils/helpers';
 import { cleanupInactiveSessions } from '../services/sessionCleanup';
@@ -10,6 +26,13 @@ interface Message {
   senderName: string;
   text: string;
   timestamp: Date;
+}
+
+interface TimerState {
+  isRunning: boolean;
+  currentPhase: 'work' | 'break' | 'longBreak';
+  timeRemaining: number;
+  round: number;
 }
 
 interface SessionContextType {
@@ -26,12 +49,7 @@ interface SessionContextType {
   participants: Participant[];
   currentTask: string;
   setCurrentTask: (task: string) => void;
-  timerState: {
-    isRunning: boolean;
-    currentPhase: 'work' | 'break' | 'longBreak';
-    timeRemaining: number;
-    round: number;
-  };
+  timerState: TimerState;
   startTimer: () => Promise<void>;
   pauseTimer: () => Promise<void>;
   skipPhase: () => Promise<void>;
@@ -44,7 +62,7 @@ interface SessionContextType {
 
 interface Session {
   id: string;
-  createdAt: Date;
+  createdAt: Date | Timestamp | null;
   hostId: string;
   workMinutes: number;
   breakMinutes: number;
@@ -55,7 +73,7 @@ interface Session {
     currentPhase: 'work' | 'break' | 'longBreak';
     timeRemaining: number;
     round: number;
-    startedAt: Date | { toDate: () => Date } | string | number | null;
+    startedAt: Date | Timestamp | null;
   };
 }
 
@@ -63,12 +81,23 @@ interface Participant {
   id: string;
   username: string;
   currentTask: string;
-  joinedAt: Date;
-  lastSeen: Date;
+  joinedAt: Date | Timestamp | null;
+  lastSeen: Date | Timestamp | null;
   avatar?: string;
-  removed?: boolean;
-  removedAt?: Date;
 }
+
+const DEFAULT_TIMER_STATE: TimerState = {
+  isRunning: false,
+  currentPhase: 'work',
+  timeRemaining: 25 * 60,
+  round: 1,
+};
+
+const HEARTBEAT_INTERVAL_MS = 30 * 1000;
+const PRESENCE_CHECK_INTERVAL_MS = 60 * 1000;
+const PARTICIPANT_INACTIVE_MS = 2 * 60 * 1000;
+const SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+const MAX_SESSION_CODE_ATTEMPTS = 10;
 
 export const SessionContext = createContext<SessionContextType | undefined>(undefined);
 
@@ -80,76 +109,437 @@ export const useSession = () => {
   return context;
 };
 
+const newParticipantId = () => Math.random().toString(36).substring(2, 11);
+
+const toDate = (value: unknown): Date | null => {
+  if (!value) return null;
+  if (value instanceof Date) return value;
+  if (value instanceof Timestamp) return value.toDate();
+  if (typeof value === 'object' && value !== null && 'toDate' in value && typeof (value as any).toDate === 'function') {
+    return (value as any).toDate();
+  }
+
+  const date = new Date(value as string | number);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+
+const normalizeSession = (data: DocumentData): Session => ({
+  id: String(data.id || ''),
+  createdAt: data.createdAt || null,
+  hostId: String(data.hostId || ''),
+  workMinutes: Number(data.workMinutes || 25),
+  breakMinutes: Number(data.breakMinutes || 5),
+  rounds: Number(data.rounds || 4),
+  longBreakMinutes: Number(data.longBreakMinutes || 15),
+  state: {
+    isRunning: Boolean(data.state?.isRunning),
+    currentPhase: (data.state?.currentPhase || 'work') as TimerState['currentPhase'],
+    timeRemaining: Number(data.state?.timeRemaining || 25 * 60),
+    round: Number(data.state?.round || 1),
+    startedAt: data.state?.startedAt || null,
+  },
+});
+
+const normalizeParticipant = (id: string, data: DocumentData): Participant => ({
+  id,
+  username: String(data.username || 'Unknown User'),
+  avatar: data.avatar,
+  currentTask: String(data.currentTask || ''),
+  joinedAt: data.joinedAt || null,
+  lastSeen: data.lastSeen || null,
+});
+
+const getCurrentTimerState = (session: Session): TimerState => {
+  let timeRemaining = session.state.timeRemaining;
+
+  if (session.state.isRunning && session.state.startedAt) {
+    const startedAt = toDate(session.state.startedAt);
+    if (startedAt) {
+      const elapsedSeconds = Math.floor((Date.now() - startedAt.getTime()) / 1000);
+      timeRemaining = Math.max(0, timeRemaining - elapsedSeconds);
+    }
+  }
+
+  return {
+    isRunning: session.state.isRunning,
+    currentPhase: session.state.currentPhase,
+    timeRemaining,
+    round: session.state.round,
+  };
+};
+
+const getPhaseDuration = (session: Session, phase: TimerState['currentPhase']) => {
+  if (phase === 'break') return session.breakMinutes * 60;
+  if (phase === 'longBreak') return session.longBreakMinutes * 60;
+  return session.workMinutes * 60;
+};
+
+const getNextTimerState = (session: Session, timerState: TimerState): TimerState => {
+  if (timerState.currentPhase === 'work') {
+    const currentPhase = timerState.round >= session.rounds ? 'longBreak' : 'break';
+    return {
+      isRunning: false,
+      currentPhase,
+      timeRemaining: getPhaseDuration(session, currentPhase),
+      round: timerState.round,
+    };
+  }
+
+  if (timerState.currentPhase === 'break') {
+    return {
+      isRunning: false,
+      currentPhase: 'work',
+      timeRemaining: getPhaseDuration(session, 'work'),
+      round: Math.min(timerState.round + 1, session.rounds),
+    };
+  }
+
+  return {
+    isRunning: false,
+    currentPhase: 'work',
+    timeRemaining: getPhaseDuration(session, 'work'),
+    round: 1,
+  };
+};
+
 export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [username, setUsername] = useState<string>('');
-  const [avatar, setAvatar] = useState<string>('cat.png'); // Default avatar
-  const [sessionCode, setSessionCode] = useState<string>('');
+  const [username, setUsername] = useState('');
+  const [avatar, setAvatar] = useState('cat.png');
+  const [sessionCode, setSessionCode] = useState('');
   const [currentSession, setCurrentSession] = useState<Session | null>(null);
   const [participants, setParticipants] = useState<Participant[]>([]);
-  const [currentTask, setCurrentTask] = useState<string>('');
-  const [timerState, setTimerState] = useState({
-    isRunning: false,
-    currentPhase: 'work' as 'work' | 'break' | 'longBreak',
-    timeRemaining: 25 * 60, // Default 25 minutes in seconds
-    round: 1,
-  });
-  const [participantId, setParticipantId] = useState<string>('');
+  const [currentTask, setCurrentTask] = useState('');
+  const [timerState, setTimerState] = useState<TimerState>(DEFAULT_TIMER_STATE);
+  const [participantId, setParticipantId] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
-  
-  // Timer interval ref
-  const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  
-  // Heartbeat interval ref for presence tracking
-  const heartbeatIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  
-  // Presence check interval ref (for host only)
-  const presenceCheckIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  
-  // Session cleanup interval ref (for all clients, but will only take effect on the first one that runs it)
-  const sessionCleanupIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
-  // DEBUG: Log state changes for currentSession and participantId
-  useEffect(() => {
-    console.log(`[SessionContext State Change] currentSession updated: ${!!currentSession}, ID: ${currentSession?.id}`);
-  }, [currentSession]);
+  const timerIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const heartbeatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const presenceCheckIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const sessionCleanupIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const phaseCompletionRef = useRef<string | null>(null);
+  const participantIdRef = useRef('');
+  const sessionCodeRef = useRef('');
+  const isHostRef = useRef(false);
+
+  const isInSession = !!currentSession && !!sessionCode;
+  const isHost = !!currentSession && currentSession.hostId === participantId;
 
   useEffect(() => {
-    console.log(`[SessionContext State Change] participantId updated: ${participantId}`);
+    participantIdRef.current = participantId;
   }, [participantId]);
 
-  // Check if user is in a session
-  const isInSession = !!currentSession;
-  
-  // Check if current user is the host
-  const isHost = currentSession?.hostId === participantId;
-
-  // Timer countdown effect
   useEffect(() => {
-    // Clear any existing timer interval
+    sessionCodeRef.current = sessionCode;
+  }, [sessionCode]);
+
+  useEffect(() => {
+    isHostRef.current = isHost;
+  }, [isHost]);
+
+  const resetLocalSession = () => {
+    setSessionCode('');
+    setCurrentSession(null);
+    setParticipants([]);
+    setCurrentTask('');
+    setTimerState(DEFAULT_TIMER_STATE);
+    setParticipantId('');
+    setMessages([]);
+    phaseCompletionRef.current = null;
+  };
+
+  const writeActivity = async (code: string, activity: Record<string, unknown>) => {
+    try {
+      await addDoc(collection(db, 'sessions', code, 'activityLog'), {
+        ...activity,
+        timestamp: serverTimestamp(),
+      });
+    } catch (error) {
+      console.error('Error writing activity log:', error);
+    }
+  };
+
+  const updateHeartbeat = async () => {
+    const code = sessionCodeRef.current;
+    const id = participantIdRef.current;
+    if (!code || !id) return;
+
+    try {
+      const participantRef = doc(db, 'sessions', code, 'participants', id);
+      const participantSnapshot = await getDoc(participantRef);
+      if (!participantSnapshot.exists()) {
+        resetLocalSession();
+        return;
+      }
+
+      await setDoc(participantRef, { lastSeen: serverTimestamp() }, { merge: true });
+    } catch (error) {
+      console.error('Error updating heartbeat:', error);
+    }
+  };
+
+  const removeParticipant = async (code: string, id: string, reason: 'inactivity' | 'kicked' | 'left') => {
+    const participantRef = doc(db, 'sessions', code, 'participants', id);
+    const participantSnapshot = await getDoc(participantRef);
+    if (!participantSnapshot.exists()) return;
+
+    const participant = normalizeParticipant(participantSnapshot.id, participantSnapshot.data());
+    await deleteDoc(participantRef);
+    await writeActivity(code, {
+      type: reason === 'kicked' ? 'participant_kicked' : reason === 'left' ? 'participant_left' : 'participant_removed',
+      participantId: id,
+      username: participant.username,
+      reason,
+    });
+  };
+
+  const deleteSessionTree = async (code: string) => {
+    const subcollections = ['participants', 'activityLog', 'messages'];
+    for (const subcollection of subcollections) {
+      const snapshot = await getDocs(collection(db, 'sessions', code, subcollection));
+      await Promise.all(snapshot.docs.map((item) => deleteDoc(item.ref)));
+    }
+    await deleteDoc(doc(db, 'sessions', code));
+  };
+
+  const createSession = async (
+    workMinutes = 25,
+    breakMinutes = 5,
+    rounds = 4,
+    longBreakMinutes = 15
+  ) => {
+    const id = newParticipantId();
+
+    for (let attempt = 0; attempt < MAX_SESSION_CODE_ATTEMPTS; attempt += 1) {
+      const code = generateSessionCode();
+      const sessionRef = doc(db, 'sessions', code);
+      const participantRef = doc(db, 'sessions', code, 'participants', id);
+      const sessionData = {
+        id: code,
+        createdAt: serverTimestamp(),
+        hostId: id,
+        workMinutes,
+        breakMinutes,
+        rounds,
+        longBreakMinutes,
+        state: {
+          isRunning: false,
+          currentPhase: 'work',
+          timeRemaining: workMinutes * 60,
+          round: 1,
+          startedAt: null,
+        },
+      };
+
+      try {
+        await runTransaction(db, async (transaction) => {
+          const existingSession = await transaction.get(sessionRef);
+          if (existingSession.exists()) {
+            throw new Error('SESSION_CODE_COLLISION');
+          }
+
+          transaction.set(sessionRef, sessionData);
+          transaction.set(participantRef, {
+            id,
+            username,
+            avatar,
+            currentTask: '',
+            joinedAt: serverTimestamp(),
+            lastSeen: serverTimestamp(),
+          });
+        });
+
+        setParticipantId(id);
+        setSessionCode(code);
+        setCurrentSession(normalizeSession({ ...sessionData, createdAt: new Date() }));
+        setTimerState({
+          isRunning: false,
+          currentPhase: 'work',
+          timeRemaining: workMinutes * 60,
+          round: 1,
+        });
+        return code;
+      } catch (error: any) {
+        if (error?.message === 'SESSION_CODE_COLLISION' && attempt < MAX_SESSION_CODE_ATTEMPTS - 1) {
+          continue;
+        }
+        console.error('Error creating session:', error);
+        throw error;
+      }
+    }
+
+    throw new Error('Unable to generate a unique session code.');
+  };
+
+  const joinSession = async (code: string): Promise<boolean> => {
+    const normalizedCode = code.trim().toUpperCase();
+    if (!normalizedCode || !username.trim()) return false;
+
+    try {
+      const sessionRef = doc(db, 'sessions', normalizedCode);
+      const sessionSnapshot = await getDoc(sessionRef);
+      if (!sessionSnapshot.exists()) return false;
+
+      const session = normalizeSession(sessionSnapshot.data());
+      const participantsSnapshot = await getDocs(collection(db, 'sessions', normalizedCode, 'participants'));
+      const existingParticipant = participantsSnapshot.docs
+        .map((item) => normalizeParticipant(item.id, item.data()))
+        .find((participant) => participant.username === username && participant.avatar === avatar);
+
+      const id = existingParticipant?.id || newParticipantId();
+      await setDoc(
+        doc(db, 'sessions', normalizedCode, 'participants', id),
+        {
+          id,
+          username,
+          avatar,
+          currentTask: existingParticipant?.currentTask || '',
+          joinedAt: existingParticipant?.joinedAt || serverTimestamp(),
+          lastSeen: serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      setParticipantId(id);
+      setSessionCode(normalizedCode);
+      setCurrentSession(session);
+      setCurrentTask(existingParticipant?.currentTask || '');
+      setTimerState(getCurrentTimerState(session));
+      return true;
+    } catch (error) {
+      console.error('Error joining session:', error);
+      resetLocalSession();
+      return false;
+    }
+  };
+
+  const leaveSession = async () => {
+    const code = sessionCodeRef.current;
+    const id = participantIdRef.current;
+    if (!code || !id) {
+      resetLocalSession();
+      return;
+    }
+
+    try {
+      const sessionRef = doc(db, 'sessions', code);
+      const participantsSnapshot = await getDocs(collection(db, 'sessions', code, 'participants'));
+      const otherParticipants = participantsSnapshot.docs
+        .map((item) => normalizeParticipant(item.id, item.data()))
+        .filter((participant) => participant.id !== id);
+
+      await removeParticipant(code, id, 'left');
+
+      if (currentSession?.hostId === id) {
+        if (otherParticipants.length > 0) {
+          await setDoc(sessionRef, { hostId: otherParticipants[0].id }, { merge: true });
+        } else {
+          await deleteSessionTree(code);
+        }
+      }
+    } catch (error) {
+      console.error('Error leaving session:', error);
+      throw error;
+    } finally {
+      resetLocalSession();
+    }
+  };
+
+  const startTimer = async () => {
+    if (!currentSession || !isHost || !sessionCode) return;
+
+    const duration = getPhaseDuration(currentSession, timerState.currentPhase);
+    const timeRemaining = timerState.timeRemaining > 0 ? timerState.timeRemaining : duration;
+
+    await setDoc(
+      doc(db, 'sessions', sessionCode),
+      {
+        state: {
+          isRunning: true,
+          currentPhase: timerState.currentPhase,
+          timeRemaining,
+          round: timerState.round,
+          startedAt: serverTimestamp(),
+        },
+      },
+      { merge: true }
+    );
+  };
+
+  const pauseTimer = async () => {
+    if (!currentSession || !isHost || !sessionCode) return;
+
+    await setDoc(
+      doc(db, 'sessions', sessionCode),
+      {
+        state: {
+          isRunning: false,
+          currentPhase: timerState.currentPhase,
+          timeRemaining: Math.max(0, timerState.timeRemaining),
+          round: timerState.round,
+          startedAt: null,
+        },
+      },
+      { merge: true }
+    );
+  };
+
+  const applyNextPhase = async (source: 'complete' | 'skip') => {
+    if (!currentSession || !isHost || !sessionCode) return;
+
+    const nextTimerState = getNextTimerState(currentSession, timerState);
+    await setDoc(
+      doc(db, 'sessions', sessionCode),
+      {
+        state: {
+          ...nextTimerState,
+          startedAt: null,
+        },
+      },
+      { merge: true }
+    );
+
+    await writeActivity(sessionCode, {
+      type: source === 'complete' ? 'phase_completed' : 'phase_skipped',
+      phase: timerState.currentPhase,
+      nextPhase: nextTimerState.currentPhase,
+      round: timerState.round,
+    });
+  };
+
+  const skipPhase = async () => applyNextPhase('skip');
+
+  const kickParticipant = async (id: string) => {
+    if (!isHost || !sessionCode || id === participantId) return;
+    await removeParticipant(sessionCode, id, 'kicked');
+  };
+
+  const sendMessage = async (text: string) => {
+    if (!sessionCode || !participantId || !username || !text.trim()) return;
+
+    await addDoc(collection(db, 'sessions', sessionCode, 'messages'), {
+      senderId: participantId,
+      senderName: username,
+      text: text.trim(),
+      timestamp: serverTimestamp(),
+    });
+  };
+
+  useEffect(() => {
     if (timerIntervalRef.current) {
       clearInterval(timerIntervalRef.current);
       timerIntervalRef.current = null;
     }
 
-    // Start the timer if running
     if (isInSession && timerState.isRunning) {
       timerIntervalRef.current = setInterval(() => {
-        setTimerState(prev => {
-          // If time is up, handle phase transition (this should be synced with Firestore)
-          if (prev.timeRemaining <= 1) {
-            return prev; // Let the server handle the phase change
-          }
-          
-          // Otherwise, decrement the time
-          return {
-            ...prev,
-            timeRemaining: prev.timeRemaining - 1
-          };
-        });
+        setTimerState((previous) => ({
+          ...previous,
+          timeRemaining: Math.max(0, previous.timeRemaining - 1),
+        }));
       }, 1000);
     }
 
-    // Clean up on unmount
     return () => {
       if (timerIntervalRef.current) {
         clearInterval(timerIntervalRef.current);
@@ -157,896 +547,199 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     };
   }, [isInSession, timerState.isRunning]);
 
-  // Phase change effect - check if timer reaches zero
   useEffect(() => {
-    if (isInSession && timerState.isRunning && timerState.timeRemaining <= 0 && isHost) {
-      handlePhaseComplete();
-    }
-  }, [timerState.timeRemaining, isInSession, timerState.isRunning]);
+    if (!currentSession || !isHost || !timerState.isRunning || timerState.timeRemaining > 0) return;
 
-  // Handle automatic phase changes when timer reaches zero
-  const handlePhaseComplete = async () => {
-    if (!currentSession) return;
-    
-    let nextPhase: 'work' | 'break' | 'longBreak' = 'work';
-    let nextRound = currentSession.state.round;
-    let nextTimeRemaining = 0;
+    const completionKey = `${sessionCode}:${timerState.currentPhase}:${timerState.round}`;
+    if (phaseCompletionRef.current === completionKey) return;
 
-    // Determine next phase
-    if (timerState.currentPhase === 'work') {
-      if (timerState.round === currentSession.rounds) {
-        nextPhase = 'longBreak';
-        nextTimeRemaining = currentSession.longBreakMinutes * 60;
-      } else {
-        nextPhase = 'break';
-        nextTimeRemaining = currentSession.breakMinutes * 60;
-      }
-    } else if (timerState.currentPhase === 'break') {
-      nextPhase = 'work';
-      nextRound = timerState.round + 1;
-      nextTimeRemaining = currentSession.workMinutes * 60;
-    } else {
-      // After long break, go back to round 1
-      nextPhase = 'work';
-      nextRound = 1;
-      nextTimeRemaining = currentSession.workMinutes * 60;
-    }
+    phaseCompletionRef.current = completionKey;
+    applyNextPhase('complete').catch((error) => {
+      phaseCompletionRef.current = null;
+      console.error('Error completing timer phase:', error);
+    });
+    // applyNextPhase intentionally reads the current render's session/timer state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSession, isHost, sessionCode, timerState.currentPhase, timerState.isRunning, timerState.round, timerState.timeRemaining]);
 
-    try {
-      // Update session state in Firestore
-      await setDoc(
-        doc(db, 'sessions', sessionCode),
-        {
-          state: {
-            isRunning: false, // Pause at phase transition
-            currentPhase: nextPhase,
-            timeRemaining: nextTimeRemaining,
-            round: nextRound,
-            startedAt: null,
-          },
-        },
-        { merge: true }
-      );
-    } catch (error) {
-      console.error('Error changing phase:', error);
-    }
-  };
-
-  // Helper function to safely convert various timestamp formats to Date
-  const convertToDate = (timestamp: any): Date | null => {
-    if (!timestamp) return null;
-    
-    try {
-      if (timestamp instanceof Date) {
-        return timestamp;
-      }
-      
-      // Firebase Timestamp with toDate method
-      if (timestamp.toDate && typeof timestamp.toDate === 'function') {
-        return timestamp.toDate();
-      }
-      
-      // Timestamp as number or string
-      const date = new Date(timestamp);
-      return !isNaN(date.getTime()) ? date : null;
-    } catch (err) {
-      console.error('Error converting timestamp:', err);
-      return null;
-    }
-  };
-
-  // Create a new Pomodoro session
-  const createSession = async (
-    workMinutes = 25,
-    breakMinutes = 5,
-    rounds = 4,
-    longBreakMinutes = 15
-  ) => {
-    const newCode = generateSessionCode();
-    const newParticipantId = Math.random().toString(36).substring(2, 9);
-    setParticipantId(newParticipantId);
-    
-    const sessionData: Session = {
-      id: newCode,
-      createdAt: new Date(),
-      hostId: newParticipantId, // Set current user as host
-      workMinutes,
-      breakMinutes,
-      rounds,
-      longBreakMinutes,
-      state: {
-        isRunning: false,
-        currentPhase: 'work',
-        timeRemaining: workMinutes * 60,
-        round: 1,
-        startedAt: null,
-      },
-    };
-
-    try {
-      await setDoc(doc(db, 'sessions', newCode), sessionData);
-      setSessionCode(newCode);
-      setCurrentSession(sessionData);
-      
-      // Add user as a participant with the same ID used for host
-      const participantData: Participant = {
-        id: newParticipantId,
-        username,
-        avatar, // Add avatar to participant
-        currentTask: '',
-        joinedAt: new Date(),
-        lastSeen: new Date(),
-      };
-
-      await setDoc(
-        doc(db, 'sessions', newCode, 'participants', newParticipantId),
-        participantData
-      );
-      
-      return newCode;
-    } catch (error) {
-      console.error('Error creating session:', error);
-      throw error;
-    }
-  };
-
-  // Join an existing session
-  const joinSession = async (code: string): Promise<boolean> => {
-    console.log(`[SessionContext] joinSession called with code: ${code}, username: ${username}, avatar: ${avatar}`);
-    try {
-      // Check if session exists
-      console.log(`[SessionContext] Querying sessions collection for id: ${code}`);
-      const sessionQuery = query(collection(db, 'sessions'), where('id', '==', code));
-      const sessionDocSnapshot = await getDocs(sessionQuery);
-      
-      if (sessionDocSnapshot.empty) {
-        console.log(`[SessionContext] Session with code ${code} not found.`);
-        return false;
-      }
-      console.log(`[SessionContext] Session found.`);
-
-      // Get the session data
-      const sessionData = sessionDocSnapshot.docs[0].data() as Session;
-      console.log(`[SessionContext] Session data fetched:`, JSON.stringify(sessionData, null, 2));
-      
-      // Get existing participants
-      console.log(`[SessionContext] Querying participants for session: ${code}`);
-      const participantsQuery = await getDocs(collection(db, 'sessions', code, 'participants'));
-      const existingParticipants = participantsQuery.docs.map(doc => doc.data() as Participant);
-      console.log(`[SessionContext] Found ${existingParticipants.length} existing participants.`);
-      
-      // Check if a user with the same username and avatar already exists
-      const existingParticipant = existingParticipants.find(
-        p => p.username === username && p.avatar === avatar
-      );
-      
-      let participantDocId: string;
-      let isReconnecting = false;
-      
-      if (existingParticipant) {
-        // Use the existing participant's ID
-        participantDocId = existingParticipant.id;
-        isReconnecting = true;
-        console.log(`[SessionContext] User ${username} reconnecting with existing ID: ${participantDocId}`);
-        
-        // Update the lastSeen timestamp and ensure not removed
-        console.log(`[SessionContext] Updating existing participant ${participantDocId} in Firestore...`);
-        await setDoc(
-          doc(db, 'sessions', code, 'participants', participantDocId),
-          {
-            lastSeen: new Date(),
-            removed: false, 
-            removedAt: null
-          },
-          { merge: true }
-        );
-        console.log(`[SessionContext] Participant ${participantDocId} updated.`);
-      } else {
-        // Generate a unique ID for this participant
-        participantDocId = Math.random().toString(36).substring(2, 9);
-        console.log(`[SessionContext] New user ${username}. Generated participant ID: ${participantDocId}`);
-
-        // Add user to participants
-        const participantData: Participant = {
-          id: participantDocId,
-          username,
-          avatar,
-          currentTask: '',
-          joinedAt: new Date(),
-          lastSeen: new Date(),
-        };
-        console.log(`[SessionContext] Adding new participant ${participantDocId} to Firestore...`);
-        await setDoc(
-          doc(db, 'sessions', code, 'participants', participantDocId),
-          participantData
-        );
-        console.log(`[SessionContext] Participant ${participantDocId} added.`);
-      }
-
-      // Set participant ID in state
-      console.log(`[SessionContext] Setting participantId state to: ${participantDocId}`);
-      setParticipantId(participantDocId); // Set this participant's ID
-
-      // Set session code and current session data
-      console.log(`[SessionContext] Setting sessionCode state to: ${code}`);
-      setSessionCode(code);
-      console.log(`[SessionContext] Setting currentSession state...`, JSON.stringify(sessionData, null, 2));
-      setCurrentSession(sessionData);
-      
-      // Calculate actual time remaining
-      console.log(`[SessionContext] Calculating actual time remaining...`);
-      let actualTimeRemaining = sessionData.state?.timeRemaining || sessionData.workMinutes * 60;
-      if (sessionData.state?.isRunning && sessionData.state?.startedAt) {
-        const startedAt = convertToDate(sessionData.state.startedAt);
-        if (startedAt) {
-          const now = new Date();
-          const elapsedSeconds = Math.floor((now.getTime() - startedAt.getTime()) / 1000);
-          actualTimeRemaining = Math.max(0, (sessionData.state?.timeRemaining || 0) - elapsedSeconds);
-          console.log(`[SessionContext] Timer running. StartedAt: ${startedAt}, Elapsed: ${elapsedSeconds}s, Calculated time remaining: ${actualTimeRemaining}`);
-        } else {
-          console.log(`[SessionContext] Timer running but invalid startedAt:`, sessionData.state.startedAt);
-        }
-      } else {
-        console.log(`[SessionContext] Timer not running or no startedAt. Initial time remaining: ${actualTimeRemaining}`);
-      }
-      
-      // Initialize timer state from session data
-      const newTimerState = {
-        isRunning: sessionData.state?.isRunning || false,
-        currentPhase: (sessionData.state?.currentPhase || 'work') as 'work' | 'break' | 'longBreak',
-        timeRemaining: actualTimeRemaining,
-        round: sessionData.state?.round || 1,
-      };
-      console.log(`[SessionContext] Setting timerState...`, JSON.stringify(newTimerState, null, 2));
-      setTimerState(newTimerState);
-      
-      console.log(`[SessionContext] joinSession finished successfully. Returning true.`);
-      return true;
-    } catch (error) {
-      console.error('[SessionContext] Error in joinSession:', error);
-      // Reset potentially partially set state on error
-      setSessionCode('');
-      setCurrentSession(null);
-      setParticipantId('');
-      setTimerState({
-        isRunning: false,
-        currentPhase: 'work',
-        timeRemaining: 25 * 60,
-        round: 1,
-      });
-      return false;
-    }
-  };
-
-  // Leave current session
-  const leaveSession = async () => {
-    if (!currentSession || !sessionCode) return;
-
-    try {
-      // Remove user from participants if we have their ID
-      if (participantId) {
-        // Properly delete the participant document when user leaves
-        await deleteDoc(doc(db, 'sessions', sessionCode, 'participants', participantId));
-        
-        // Log the leave action if activity logging is enabled
-        try {
-          const activityLogRef = collection(db, 'sessions', sessionCode, 'activityLog');
-          await setDoc(doc(activityLogRef), {
-            type: 'participant_left',
-            participantId,
-            username,
-            timestamp: new Date()
-          });
-        } catch (logError) {
-          console.error('Error logging leave activity:', logError);
-        }
-      }
-
-      // Reset local state
-      setSessionCode('');
-      setCurrentSession(null);
-      setParticipants([]);
-      setCurrentTask('');
-      setParticipantId('');
-      setTimerState({
-        isRunning: false,
-        currentPhase: 'work' as 'work' | 'break' | 'longBreak',
-        timeRemaining: 25 * 60,
-        round: 1,
-      });
-    } catch (error) {
-      console.error('Error leaving session:', error);
-      throw error;
-    }
-  };
-
-  // Start timer for current session
-  const startTimer = async () => {
-    if (!currentSession || !isHost) return;
-    
-    try {
-      // Get the next phase timing based on current phase
-      let timeRemaining = currentSession.state.timeRemaining;
-      
-      if (timeRemaining <= 0) {
-        // If timer was at 0, reset it to the correct duration for the current phase
-        if (currentSession.state.currentPhase === 'work') {
-          timeRemaining = currentSession.workMinutes * 60;
-        } else if (currentSession.state.currentPhase === 'break') {
-          timeRemaining = currentSession.breakMinutes * 60;
-        } else {
-          timeRemaining = currentSession.longBreakMinutes * 60;
-        }
-      }
-      
-      // Update session state in Firestore
-      await setDoc(
-        doc(db, 'sessions', sessionCode),
-        {
-          state: {
-            isRunning: true,
-            timeRemaining,
-            startedAt: new Date(),
-            currentPhase: currentSession.state.currentPhase,
-            round: currentSession.state.round,
-          },
-        },
-        { merge: true }
-      );
-    } catch (error) {
-      console.error('Error starting timer:', error);
-      throw error;
-    }
-  };
-
-  // Pause timer for current session
-  const pauseTimer = async () => {
-    if (!currentSession || !isHost) return;
-    
-    try {
-      // Update session state in Firestore
-      await setDoc(
-        doc(db, 'sessions', sessionCode),
-        {
-          state: {
-            isRunning: false,
-            timeRemaining: timerState.timeRemaining,
-            startedAt: null,
-            currentPhase: currentSession.state.currentPhase,
-            round: currentSession.state.round,
-          },
-        },
-        { merge: true }
-      );
-    } catch (error) {
-      console.error('Error pausing timer:', error);
-      throw error;
-    }
-  };
-
-  // Skip current phase
-  const skipPhase = async () => {
-    if (!currentSession || !isHost) return;
-    
-    try {
-      // Determine the next phase
-      let nextPhase: 'work' | 'break' | 'longBreak';
-      let nextRound = timerState.round;
-      let nextTimeRemaining = 0;
-      
-      // Similar logic to handlePhaseComplete
-      if (timerState.currentPhase === 'work') {
-        if (timerState.round === currentSession.rounds) {
-          nextPhase = 'longBreak';
-          nextTimeRemaining = currentSession.longBreakMinutes * 60;
-        } else {
-          nextPhase = 'break';
-          nextTimeRemaining = currentSession.breakMinutes * 60;
-        }
-      } else if (timerState.currentPhase === 'break') {
-        nextPhase = 'work';
-        nextRound = timerState.round + 1;
-        nextTimeRemaining = currentSession.workMinutes * 60;
-      } else {
-        // After long break, go back to round 1
-        nextPhase = 'work';
-        nextRound = 1;
-        nextTimeRemaining = currentSession.workMinutes * 60;
-      }
-      
-      // Update session state in Firestore
-      await setDoc(
-        doc(db, 'sessions', sessionCode),
-        {
-          state: {
-            isRunning: false, // Pause after skip
-            currentPhase: nextPhase,
-            timeRemaining: nextTimeRemaining,
-            round: nextRound,
-            startedAt: null,
-          },
-        },
-        { merge: true }
-      );
-    } catch (error) {
-      console.error('Error skipping phase:', error);
-      throw error;
-    }
-  };
-
-  // Update current task in Firestore
   useEffect(() => {
-    if (participantId && sessionCode && currentTask) {
-      try {
-        setDoc(
-          doc(db, 'sessions', sessionCode, 'participants', participantId),
-          { currentTask },
-          { merge: true }
-        );
-      } catch (error) {
-        console.error('Error updating task:', error);
-      }
-    }
-  }, [currentTask, sessionCode, participantId]);
+    if (!participantId || !sessionCode) return;
 
-  // Listen for session changes
+    setDoc(
+      doc(db, 'sessions', sessionCode, 'participants', participantId),
+      { currentTask: currentTask.trim() },
+      { merge: true }
+    ).catch((error) => {
+      console.error('Error updating task:', error);
+    });
+  }, [currentTask, participantId, sessionCode]);
+
   useEffect(() => {
     if (!sessionCode) return;
 
-    const unsubscribe = onSnapshot(doc(db, 'sessions', sessionCode), (doc) => {
-      if (doc.exists()) {
-        const sessionData = doc.data() as Session;
-        setCurrentSession(sessionData);
-        
-        // Calculate actual time remaining if session is running (with safer handling)
-        let actualTimeRemaining = sessionData.state?.timeRemaining || 25 * 60;
-        
-        if (sessionData.state?.isRunning && sessionData.state?.startedAt) {
-          const startedAt = convertToDate(sessionData.state.startedAt);
-          
-          if (startedAt) {
-            const now = new Date();
-            const elapsedSeconds = Math.floor((now.getTime() - startedAt.getTime()) / 1000);
-            actualTimeRemaining = Math.max(0, actualTimeRemaining - elapsedSeconds);
-          }
+    const unsubscribe = onSnapshot(
+      doc(db, 'sessions', sessionCode),
+      (snapshot) => {
+        if (!snapshot.exists()) {
+          resetLocalSession();
+          return;
         }
-        
-        setTimerState({
-          isRunning: sessionData.state?.isRunning || false,
-          currentPhase: (sessionData.state?.currentPhase || 'work') as 'work' | 'break' | 'longBreak',
-          timeRemaining: actualTimeRemaining,
-          round: sessionData.state?.round || 1,
-        });
+
+        const session = normalizeSession(snapshot.data());
+        setCurrentSession(session);
+        setTimerState(getCurrentTimerState(session));
+
+        if (!session.state.isRunning) {
+          phaseCompletionRef.current = null;
+        }
+      },
+      (error) => {
+        console.error('Error listening for session changes:', error);
       }
-    });
+    );
 
     return () => unsubscribe();
   }, [sessionCode]);
 
-  // Listen for participants
   useEffect(() => {
     if (!sessionCode) return;
 
-    const unsubscribe = onSnapshot(collection(db, 'sessions', sessionCode, 'participants'), (snapshot) => {
-      const participants: Participant[] = [];
-      snapshot.forEach((doc) => {
-        const participant = doc.data() as Participant;
-        // Only include active participants (not removed)
-        if (!participant.removed) {
-          participants.push(participant);
+    const unsubscribe = onSnapshot(
+      collection(db, 'sessions', sessionCode, 'participants'),
+      (snapshot) => {
+        const activeParticipants = snapshot.docs.map((item) => normalizeParticipant(item.id, item.data()));
+        setParticipants(activeParticipants);
+
+        const currentId = participantIdRef.current;
+        if (currentId && !activeParticipants.some((participant) => participant.id === currentId)) {
+          resetLocalSession();
         }
-      });
-      setParticipants(participants);
-      
-      // Check if current user has been kicked (no longer in participants list)
-      // --- TEMPORARILY COMMENTED OUT TO DEBUG JOIN ISSUE ---
-      /*
-      if (participantId && !participants.some(p => p.id === participantId)) {
-        // Current user is no longer in participants list - they've been kicked
-        // Reset local state to send them back to join/create screen
-        console.log(`[SessionContext Participant Listener] User ${participantId} not found in participants list. Resetting state.`);
-        setSessionCode('');
-        setCurrentSession(null);
-        setParticipants([]);
-        setCurrentTask('');
-        setTimerState({
-          isRunning: false,
-          currentPhase: 'work',
-          timeRemaining: 25 * 60,
-          round: 1,
-        });
-        // Keep participantId so they can rejoin with a different session
+      },
+      (error) => {
+        console.error('Error listening for participants:', error);
       }
-      */
-      // --- END TEMPORARY COMMENT ---
-    });
+    );
 
     return () => unsubscribe();
-  }, [sessionCode, participantId]);
+  }, [sessionCode]);
 
-  // Heartbeat effect - update lastSeen timestamp every 30 seconds
   useEffect(() => {
-    // Clear any existing heartbeat interval
     if (heartbeatIntervalRef.current) {
       clearInterval(heartbeatIntervalRef.current);
       heartbeatIntervalRef.current = null;
     }
-    
-    // Start the heartbeat if in a session
+
     if (isInSession && participantId && sessionCode) {
-      // Immediately update lastSeen timestamp
       updateHeartbeat();
-      
-      // Set interval to update lastSeen timestamp
-      heartbeatIntervalRef.current = setInterval(() => {
-        updateHeartbeat();
-      }, 30000); // Every 30 seconds
+      heartbeatIntervalRef.current = setInterval(updateHeartbeat, HEARTBEAT_INTERVAL_MS);
     }
-    
-    // Clean up on unmount
+
     return () => {
       if (heartbeatIntervalRef.current) {
         clearInterval(heartbeatIntervalRef.current);
       }
     };
+    // updateHeartbeat reads latest ids from refs, so it should not restart the interval on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isInSession, participantId, sessionCode]);
-  
-  // Update user's heartbeat (lastSeen timestamp)
-  const updateHeartbeat = async () => {
-    if (!participantId || !sessionCode) return;
-    
-    try {
-      await setDoc(
-        doc(db, 'sessions', sessionCode, 'participants', participantId),
-        { 
-          lastSeen: new Date() 
-        },
-        { merge: true }
-      );
-    } catch (error) {
-      console.error('Error updating heartbeat:', error);
-    }
-  };
-  
-  // Presence check effect - check and remove inactive participants (host only)
+
   useEffect(() => {
-    // Clear any existing presence check interval
     if (presenceCheckIntervalRef.current) {
       clearInterval(presenceCheckIntervalRef.current);
       presenceCheckIntervalRef.current = null;
     }
-    
-    // Start the presence check if in a session and is host
+
     if (isInSession && isHost && sessionCode) {
-      // Set interval to check inactive participants
-      presenceCheckIntervalRef.current = setInterval(() => {
-        checkInactiveParticipants();
-      }, 60000); // Every 60 seconds (1 minute)
+      presenceCheckIntervalRef.current = setInterval(async () => {
+        try {
+          const snapshot = await getDocs(collection(db, 'sessions', sessionCode, 'participants'));
+          const now = Date.now();
+          const inactiveParticipants = snapshot.docs
+            .map((item) => normalizeParticipant(item.id, item.data()))
+            .filter((participant) => {
+              if (participant.id === currentSession?.hostId) return false;
+              const lastSeen = toDate(participant.lastSeen);
+              return !lastSeen || now - lastSeen.getTime() > PARTICIPANT_INACTIVE_MS;
+            });
+
+          await Promise.all(inactiveParticipants.map((participant) => removeParticipant(sessionCode, participant.id, 'inactivity')));
+        } catch (error) {
+          console.error('Error checking inactive participants:', error);
+        }
+      }, PRESENCE_CHECK_INTERVAL_MS);
     }
-    
-    // Clean up on unmount
+
     return () => {
       if (presenceCheckIntervalRef.current) {
         clearInterval(presenceCheckIntervalRef.current);
       }
     };
-  }, [isInSession, isHost, sessionCode]);
-  
-  // Check and remove inactive participants
-  const checkInactiveParticipants = async () => {
-    if (!isHost || !sessionCode) return;
-    
-    try {
-      const now = new Date();
-      const inactiveThreshold = 1 * 60 * 1000; // 1 minute in milliseconds
-      
-      // Get fresh participant data directly from the database
-      const participantsSnapshot = await getDocs(collection(db, 'sessions', sessionCode, 'participants'));
-      
-      if (participantsSnapshot.empty) {
-        console.log('No participants found in the session.');
-        return;
-      }
-      
-      const allParticipants = participantsSnapshot.docs.map(doc => {
-        try {
-          return { id: doc.id, ...doc.data() } as Participant;
-        } catch (err) {
-          console.warn(`Error processing participant data for ${doc.id}:`, err);
-          // Return a minimal valid participant object to avoid crashes
-          return { 
-            id: doc.id, 
-            username: 'Error reading username', 
-            currentTask: '', 
-            joinedAt: new Date(), 
-            lastSeen: new Date(0) // Old date to mark as inactive
-          } as Participant;
-        }
-      });
-      
-      if (!allParticipants.length) {
-        console.log('No valid participants found after processing.');
-        return;
-      }
-      
-      const inactiveParticipants = allParticipants.filter(participant => {
-        try {
-        // Don't remove the host
-        if (participant.id === currentSession?.hostId) return false;
-        
-        // Check if participant is inactive
-        const lastSeen = participant.lastSeen;
-        if (!lastSeen) return true; // No lastSeen timestamp, consider inactive
-        
-          // Safe conversion to date
-          let lastSeenDate: Date;
-          try {
-            // Try to handle various formats safely
-            if (lastSeen instanceof Date) {
-              lastSeenDate = lastSeen;
-            } else if (typeof lastSeen === 'object' && lastSeen !== null) {
-              // Check if it's a Firebase Timestamp (has toDate method)
-              const maybeTimestamp = lastSeen as any;
-              if (typeof maybeTimestamp.toDate === 'function') {
-                lastSeenDate = maybeTimestamp.toDate();
-              } else {
-                // Fall back to string conversion
-                lastSeenDate = new Date(String(lastSeen));
-              }
-            } else if (typeof lastSeen === 'number') {
-              lastSeenDate = new Date(lastSeen);
-            } else if (typeof lastSeen === 'string') {
-              lastSeenDate = new Date(lastSeen);
-            } else {
-              console.warn(`Unrecognized lastSeen format for ${participant.id}:`, lastSeen);
-              return true; // Consider inactive if format is unrecognized
-            }
-          } catch (err) {
-            console.warn(`Error parsing lastSeen date for ${participant.id}:`, err);
-            return true; // Consider inactive if there's a parsing error
-          }
-          
-          // Check for valid date
-          if (isNaN(lastSeenDate.getTime())) {
-            console.warn(`Invalid date for participant ${participant.id}`);
-            return true; // Consider inactive if date is invalid
-          }
-          
-        const timeSinceLastSeen = now.getTime() - lastSeenDate.getTime();
-        return timeSinceLastSeen > inactiveThreshold;
-        } catch (err) {
-          console.warn(`Error checking if participant ${participant.id} is inactive:`, err);
-          return true; // Consider inactive if there's any error in processing
-        }
-      });
-      
-      console.log(`Found ${inactiveParticipants.length} inactive participants out of ${allParticipants.length} total`);
-      
-      // Remove inactive participants
-      for (const participant of inactiveParticipants) {
-        try {
-          await removeParticipant(participant.id, 'inactivity');
-          const timeAgo = participant.lastSeen ? formatTimeAgo(participant.lastSeen) : 'unknown time';
-          console.log(`Removed inactive participant: ${participant.username || 'Unknown'}, last seen ${timeAgo}`);
-        } catch (err) {
-          console.error(`Error removing participant ${participant.id}:`, err);
-        }
-      }
-    } catch (error) {
-      console.error('Error checking inactive participants:', error);
-    }
-  };
-  
-  // Helper to format time ago for logging
-  const formatTimeAgo = (date: any): string => {
-    try {
-      // Check if date is missing or invalid
-      if (!date) return 'unknown time';
-      
-      // Ensure we have a valid Date object
-      let dateObj: Date;
-      
-      if (date instanceof Date) {
-        dateObj = date;
-      } else if (typeof date === 'object' && date !== null && 'toDate' in date && typeof date.toDate === 'function') {
-        // Handle Firebase Timestamp objects
-        dateObj = date.toDate();
-      } else if (typeof date === 'number') {
-        dateObj = new Date(date);
-      } else if (typeof date === 'string') {
-        dateObj = new Date(date);
-      } else {
-        return 'unknown format';
-      }
-      
-      // Verify we have a valid Date
-      if (isNaN(dateObj.getTime())) {
-        return 'invalid date';
-      }
-    
-    const now = new Date();
-      const seconds = Math.floor((now.getTime() - dateObj.getTime()) / 1000);
-    
-    if (seconds < 60) return `${seconds} seconds ago`;
-    if (seconds < 3600) return `${Math.floor(seconds / 60)} minutes ago`;
-    if (seconds < 86400) return `${Math.floor(seconds / 3600)} hours ago`;
-    return `${Math.floor(seconds / 86400)} days ago`;
-    } catch (error) {
-      console.warn('Error formatting time:', error);
-      return 'error calculating time';
-    }
-  };
-  
-  // Remove a participant from the session
-  const removeParticipant = async (participantId: string, reason: 'inactivity' | 'kicked' = 'inactivity') => {
-    if (!sessionCode) return;
-    
-    try {
-      // Get participant data before removing for logging purposes
-      const participantRef = doc(db, 'sessions', sessionCode, 'participants', participantId);
-      const participantSnapshot = await getDoc(participantRef);
-      
-      if (participantSnapshot.exists()) {
-        const participantData = participantSnapshot.data() as Participant;
-        console.log(`Removing participant: ${participantData.username}, reason: ${reason}`);
-        
-        // Delete the participant document to fully remove them
-        await deleteDoc(participantRef);
-        
-        // Add to session activity log if needed
-        try {
-          const activityLogRef = collection(db, 'sessions', sessionCode, 'activityLog');
-          await addDoc(activityLogRef, {
-            type: reason === 'kicked' ? 'participant_kicked' : 'participant_removed',
-            participantId,
-            username: participantData.username,
-            reason,
-            timestamp: new Date()
-          });
-        } catch (logError) {
-          console.error('Error logging activity:', logError);
-        }
-      }
-    } catch (error) {
-      console.error('Error removing participant:', error);
-    }
-  };
+    // removeParticipant is intentionally omitted to keep the presence interval stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSession?.hostId, isHost, isInSession, sessionCode]);
 
-  // Publicly exposed function to kick a participant (only host can use)
-  const kickParticipant = async (participantId: string) => {
-    if (!isHost || !sessionCode) return;
-    await removeParticipant(participantId, 'kicked');
-  };
-
-  // Session cleanup effect - check for abandoned sessions every 5 minutes
   useEffect(() => {
-    // Clear any existing cleanup interval
     if (sessionCleanupIntervalRef.current) {
       clearInterval(sessionCleanupIntervalRef.current);
       sessionCleanupIntervalRef.current = null;
     }
-    
-    // Set interval to check for abandoned sessions
-    sessionCleanupIntervalRef.current = setInterval(() => {
-      // Only run if we're in a session (ensures the app is actively being used)
-      if (isInSession) {
-        triggerSessionCleanup();
-      }
-    }, 5 * 60 * 1000); // Every 5 minutes
-    
-    // Clean up on unmount
+
+    if (isInSession) {
+      sessionCleanupIntervalRef.current = setInterval(() => {
+        cleanupInactiveSessions().catch((error) => {
+          console.error('Error during session cleanup:', error);
+        });
+      }, SESSION_CLEANUP_INTERVAL_MS);
+    }
+
     return () => {
       if (sessionCleanupIntervalRef.current) {
         clearInterval(sessionCleanupIntervalRef.current);
       }
     };
   }, [isInSession]);
-  
-  // Trigger cleanup of abandoned sessions
-  const triggerSessionCleanup = async () => {
-    try {
-      await cleanupInactiveSessions();
-    } catch (error) {
-      console.error('Error during session cleanup:', error);
-    }
-  };
 
-  // Listen for chat messages (modified to handle IDs)
   useEffect(() => {
     if (!sessionCode) return;
 
-    const messagesRef = collection(db, 'sessions', sessionCode, 'messages');
     const messagesQuery = query(
-      messagesRef,
+      collection(db, 'sessions', sessionCode, 'messages'),
       orderBy('timestamp', 'desc'),
-      limit(50) // Consider increasing limit if chat is very active
+      limit(50)
     );
 
-    console.log('[SessionContext] Setting up chat messages listener...');
-    const unsubscribe = onSnapshot(messagesQuery, (snapshot) => {
-      console.log(`[SessionContext] Chat snapshot received with ${snapshot.docs.length} docs.`);
-      const newMessages: Message[] = [];
-      snapshot.forEach((doc) => {
-        const data = doc.data();
-        // Prioritize Firestore doc.id, use sender+timestamp as a fallback for key if needed
-        // Although the tempId approach in sendMessage should make this less critical
-        const messageId = doc.id || `fallback_${data.senderId}_${data.timestamp?.seconds || Date.now()}`;
-        newMessages.push({
-          id: messageId, // Ensure ID is always present
-          senderId: data.senderId,
-          senderName: data.senderName,
-          text: data.text,
-          timestamp: data.timestamp instanceof Timestamp 
-            ? data.timestamp.toDate() 
-            : (data.timestamp ? new Date(data.timestamp) : new Date()), // Handle potential undefined timestamp
-        });
-      });
-      // Sort messages chronologically (oldest first)
-      console.log(`[SessionContext] Updating messages state with ${newMessages.length} messages.`);
-      setMessages(newMessages.reverse());
-    }, (error) => {
-      console.error("[SessionContext] Error in chat messages listener:", error);
-    });
+    const unsubscribe = onSnapshot(
+      messagesQuery,
+      (snapshot) => {
+        const newMessages = snapshot.docs
+          .map((item) => {
+            const data = item.data();
+            return {
+              id: item.id,
+              senderId: String(data.senderId || ''),
+              senderName: String(data.senderName || 'Unknown User'),
+              text: String(data.text || ''),
+              timestamp: toDate(data.timestamp) || new Date(),
+            };
+          })
+          .reverse();
 
-    return () => {
-      console.log('[SessionContext] Cleaning up chat messages listener.');
-      unsubscribe();
-    }
+        setMessages(newMessages);
+      },
+      (error) => {
+        console.error('Error listening for chat messages:', error);
+      }
+    );
+
+    return () => unsubscribe();
   }, [sessionCode]);
 
-  // Send a new chat message
-  const sendMessage = async (text: string) => {
-    if (!sessionCode || !participantId || !username || !text.trim()) return;
-
-    // Generate a temporary client-side ID for immediate rendering
-    const tempId = `temp_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-
-    const messageData = {
-      id: tempId, // Include the temporary ID
-      senderId: participantId,
-      senderName: username,
-      text: text.trim(),
-      timestamp: new Date()
-    };
-
-    try {
-      console.log(`[SessionContext] Sending message (tempId: ${tempId}):`, messageData);
-      const messagesRef = collection(db, 'sessions', sessionCode, 'messages');
-      // Add to Firestore (Firestore will assign its own ID eventually)
-      await addDoc(messagesRef, {
-        // Don't save the tempId to Firestore
-        senderId: messageData.senderId,
-        senderName: messageData.senderName,
-        text: messageData.text,
-        timestamp: messageData.timestamp
-      });
-      console.log(`[SessionContext] Message added to Firestore successfully.`);
-      
-      // Optional: Optimistically add to local state immediately? 
-      // Currently relying on onSnapshot, which is generally fine.
-      // setMessages(prev => [...prev, messageData]); 
-
-    } catch (error) {
-      console.error('[SessionContext] Error sending message:', error);
-      // Maybe remove the optimistically added message if needed
-    }
-  };
-
-  // Clean up all intervals on unmount
   useEffect(() => {
     return () => {
-      if (timerIntervalRef.current) {
-        clearInterval(timerIntervalRef.current);
-      }
-      if (heartbeatIntervalRef.current) {
-        clearInterval(heartbeatIntervalRef.current);
-      }
-      if (presenceCheckIntervalRef.current) {
-        clearInterval(presenceCheckIntervalRef.current);
-      }
-      if (sessionCleanupIntervalRef.current) {
-        clearInterval(sessionCleanupIntervalRef.current);
-      }
+      if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
+      if (heartbeatIntervalRef.current) clearInterval(heartbeatIntervalRef.current);
+      if (presenceCheckIntervalRef.current) clearInterval(presenceCheckIntervalRef.current);
+      if (sessionCleanupIntervalRef.current) clearInterval(sessionCleanupIntervalRef.current);
     };
   }, []);
 
@@ -1076,4 +769,4 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
   };
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
-}; 
+};
